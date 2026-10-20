@@ -13615,11 +13615,15 @@ const CAREER_ENGINE_ANAK = {
             }
 
             if (action === "approveUser") {
-              let { data: user } = await supabaseClient.from('users_metadata').update({ status: payloadData.status }).eq('id', payloadData.row).select().single();
-              if (user && payloadData.status === "Approved") {
+              let { data: updRows, error: updErr } = await supabaseClient.from('users_metadata').update({ status: payloadData.status }).eq('id', payloadData.row).select();
+              if (updErr) return { success: false, message: "Gagal update status: " + updErr.message };
+              let user = (updRows || [])[0];
+              if (!user) return { success: false, message: "Data praktisi tidak ditemukan atau akses ditolak (cek RLS tabel users_metadata)." };
+              if (payloadData.status === "Approved") {
                  let { data: existingP } = await supabaseClient.from('practitioners').select('email').ilike('email', user.email).maybeSingle();
                  if (!existingP) {
-                    await supabaseClient.from('practitioners').insert({ email: user.email, nama: user.nama, wa: user.wa, instansi: user.instansi, sisa_kredit: 0 });
+                    let { error: insErr } = await supabaseClient.from('practitioners').insert({ email: user.email, nama: user.nama, wa: user.wa, sisa_kredit: 0 });
+                    if (insErr) return { success: false, message: "Status diubah, tapi gagal membuat data praktisi: " + insErr.message };
                  }
               }
               return { success: true, message: "Status diubah menjadi " + payloadData.status };
@@ -13746,6 +13750,25 @@ const CAREER_ENGINE_ANAK = {
               };
             }
 
+            if (action === "editMasaFree") {
+              let emailPrak = (payloadData.email || "").toString().trim().toLowerCase();
+              let newExp = new Date(payloadData.expired);
+              if (!emailPrak || isNaN(newExp.getTime())) return { success: false, message: "Data tidak valid." };
+              let { data: p } = await supabaseClient.from('practitioners').select('*').ilike('email', emailPrak).maybeSingle();
+              if (!p) return { success: false, message: "Praktisi tidak ditemukan." };
+              let { error: errU } = await supabaseClient.from('practitioners').update({ kredit_free_expired: newExp.toISOString() }).ilike('email', emailPrak);
+              if (errU) return { success: false, message: errU.message };
+              let tglStr = newExp.toLocaleDateString('id-ID', {day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit'});
+              await supabaseClient.from('credit_history').insert({
+                 email_praktisi: p.email || emailPrak,
+                 jenis: "Ubah Masa Berjangka",
+                 jumlah: 0,
+                 saldo: (p.sisa_kredit || 0) + (p.kredit_free || 0),
+                 ket: (payloadData.keterangan || "Ubah masa berlaku kredit free oleh Admin") + " (s/d " + tglStr + ")"
+              });
+              return { success: true, message: "Masa berlaku kredit free berhasil diperbarui." };
+            }
+
             if (action === "kelolaKredit") {
               let { email, jenis, jumlah, keterangan, durasiBulan } = payloadData;
               let emailPrak = (email || "").toString().trim().toLowerCase();
@@ -13766,13 +13789,19 @@ const CAREER_ENGINE_ANAK = {
               let sisaFree = p.kredit_free || 0;
               let expiredStr = p.kredit_free_expired || "";
               let jClean = (jenis || "").toString().toLowerCase();
+              let isKurang = jClean.includes("kurang");
+              let isFree = jClean.includes("berjangka") || jClean.includes("free");
 
-              if (jClean === "topup" || jClean.includes("top up reguler") || (jClean.includes("top") && jClean.includes("reguler"))) {
+              if (isKurang && isFree) {
+                 sisaFree = Math.max(0, sisaFree - jm);
+              } else if (isKurang) {
+                 sisaReg = Math.max(0, sisaReg - jm);
+              } else if (jClean === "topup" || jClean.includes("top up reguler") || (jClean.includes("top") && jClean.includes("reguler"))) {
                  sisaReg += jm;
               } else if (jClean === "topup_free" || jClean.includes("berjangka") || jClean.includes("top up berjangka")) {
                  sisaFree += jm;
                  let expDate = new Date();
-                 expDate.setMonth(expDate.getMonth() + parseInt(durasiBulan || 1));
+                 { let durStr = String(durasiBulan || "1"); if (durStr.endsWith("w")) expDate.setDate(expDate.getDate() + 7 * (parseInt(durStr) || 1)); else expDate.setMonth(expDate.getMonth() + (parseInt(durStr) || 1)); }
                  expiredStr = expDate.toISOString();
               } else if (jClean === "kurangi" || jClean.includes("kurangi reguler")) {
                  sisaReg = Math.max(0, sisaReg - jm);
@@ -13792,8 +13821,8 @@ const CAREER_ENGINE_ANAK = {
 
               if (errP) console.error("Practitioner credit upsert error:", errP);
 
-              let jenisHist = jClean.includes("berjangka") ? "Top Up Berjangka" : (jClean.includes("kurang") ? "Kurangi Reguler" : "Top Up Reguler");
-              let jumlahHist = jClean.includes("kurang") ? -jm : jm;
+              let jenisHist = isKurang ? (isFree ? "Kurangi Berjangka" : "Kurangi Reguler") : (isFree ? "Top Up Berjangka" : "Top Up Reguler");
+              let jumlahHist = isKurang ? -jm : jm;
               let saldoTotal = sisaReg + sisaFree;
 
               await supabaseClient.from('credit_history').insert({
@@ -13929,7 +13958,7 @@ const CAREER_ENGINE_ANAK = {
               let expStr = "";
               if (kreditFree > 0) {
                  let d = new Date();
-                 d.setMonth(d.getMonth() + parseInt(pData.durasiFree || 1));
+                 { let durStr = String(pData.durasiFree || "1"); if (durStr.endsWith("w")) d.setDate(d.getDate() + 7 * (parseInt(durStr) || 1)); else d.setMonth(d.getMonth() + (parseInt(durStr) || 1)); }
                  expStr = d.toISOString();
               }
 
@@ -14678,7 +14707,7 @@ const CAREER_ENGINE_ANAK = {
         
         let htmlPending = '';
         if(data.praktisiPending.length === 0) htmlPending = '<tr><td colspan="4" class="text-center py-4 text-slate-400">Tidak ada antrean.</td></tr>';
-        data.praktisiPending.forEach(p => { htmlPending += `<tr class="border-b border-slate-100"><td class="px-4 py-2 font-bold">${p.nama}</td><td class="px-4 py-2">${p.email}<br><span class="text-xs text-slate-400">${p.wa}</span></td><td class="px-4 py-2">${p.instansi}</td><td class="px-4 py-2 text-right"><button onclick="approveUser(${p.row}, 'Approved')" class="text-emerald-600 hover:bg-emerald-50 px-2 py-1 rounded text-xs font-bold mr-2 border border-emerald-200">Approve</button><button onclick="approveUser(${p.row}, 'Rejected')" class="text-rose-600 hover:bg-rose-50 px-2 py-1 rounded text-xs font-bold border border-rose-200">Reject</button></td></tr>`; });
+        data.praktisiPending.forEach(p => { htmlPending += `<tr class="border-b border-slate-100"><td class="px-4 py-2 font-bold">${p.nama}</td><td class="px-4 py-2">${p.email}<br><span class="text-xs text-slate-400">${p.wa}</span></td><td class="px-4 py-2">${p.instansi}</td><td class="px-4 py-2 text-right"><button onclick="approveUser('${p.row}', 'Approved')" class="text-emerald-600 hover:bg-emerald-50 px-2 py-1 rounded text-xs font-bold mr-2 border border-emerald-200">Approve</button><button onclick="approveUser('${p.row}', 'Rejected')" class="text-rose-600 hover:bg-rose-50 px-2 py-1 rounded text-xs font-bold border border-rose-200">Reject</button></td></tr>`; });
         document.getElementById('tablePending').innerHTML = htmlPending;
 
         let htmlPrak = '';
@@ -14688,7 +14717,7 @@ const CAREER_ENGINE_ANAK = {
            if (p.freeKredit > 0) {
               let expiredDate = new Date(p.freeExpired);
               let dateStr = expiredDate.toLocaleDateString('id-ID', {day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit'});
-              freeBadge = `<div class="text-[10px] text-amber-650 font-bold mt-1.5"><i class="fas fa-hourglass-half text-amber-500"></i> Free: ${p.freeKredit}<br><span class="text-slate-400 font-normal">s/d ${dateStr}</span></div>`;
+              freeBadge = `<div class="text-[10px] text-amber-650 font-bold mt-1.5"><i class="fas fa-hourglass-half text-amber-500"></i> Free: ${p.freeKredit}<br><span class="text-slate-400 font-normal">s/d ${dateStr}</span><br><button onclick="modalEditMasaFree('${p.email}', '${p.nama}', '${p.freeExpired}', ${p.freeKredit})" class="mt-1 text-[10px] text-teal-700 hover:text-teal-900 underline font-bold"><i class="fas fa-calendar-alt"></i> Ubah Masa</button></div>`;
            }
            htmlPrak += `<tr class="border-b border-slate-100"><td class="px-4 py-3 font-bold text-dark">${p.nama}</td><td class="px-4 py-3 text-xs">${p.email}</td><td class="px-4 py-3 text-center"><span class="bg-emerald-100 text-emerald-800 font-bold px-2 py-1 rounded text-xs">Reguler: ${p.sisa}</span>${freeBadge}</td><td class="px-4 py-3 text-center text-slate-500">${p.digunakan}</td><td class="px-4 py-3 text-right whitespace-nowrap"><button onclick="editPrakProfilByAdmin('${p.email}', '${p.nama}', '${p.foto}', '${p.alamat}', '${p.wa}', '${descEscaped}')" class="bg-amber-600 hover:bg-amber-700 text-white px-2 py-1 rounded text-xs font-bold mr-1"><i class="fas fa-user-edit"></i> Edit Profil</button><button onclick="modalKredit('${p.email}', '${p.nama}', 'Top Up')" class="bg-blue-600 hover:bg-blue-700 text-white px-2 py-1 rounded text-xs font-bold mr-1">Top Up</button><button onclick="modalKredit('${p.email}', '${p.nama}', 'Top Up Berjangka')" class="bg-teal-600 hover:bg-teal-700 text-white px-2 py-1 rounded text-xs font-bold mr-1">Top Up Free</button><button onclick="modalKredit('${p.email}', '${p.nama}', 'Kurangi')" class="bg-rose-600 hover:bg-rose-700 text-white px-2 py-1 rounded text-xs font-bold">Kurangi</button></td></tr>`; 
         });
@@ -14757,7 +14786,7 @@ const CAREER_ENGINE_ANAK = {
       });
     }
 
-    function approveUser(row, status) { callAPI('approveUser', {row: row, status: status}).then(res => { if(res.success) { Swal.fire('Sukses', res.message, 'success'); loadAdminData(); } }); }
+    function approveUser(row, status) { callAPI('approveUser', {row: row, status: status}).then(res => { if(res && res.success) { Swal.fire('Sukses', res.message, 'success'); loadAdminData(); } else { Swal.fire('Gagal', (res && res.message) || 'Terjadi kesalahan.', 'error'); } }).catch(err => Swal.fire('Gagal', err.message || String(err), 'error')); }
 
     function renderAdminPesertaTable(clients) {
        let html = "";
@@ -14849,6 +14878,50 @@ const CAREER_ENGINE_ANAK = {
        document.getElementById("reportContainer").classList.add("hidden-view");
      }
 
+     function modalEditMasaFree(email, nama, expiredIso, jumlahFree) {
+       const toLocalInput = (d) => { const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000); return z.toISOString().slice(0, 16); };
+       let cur = new Date(expiredIso);
+       if (isNaN(cur.getTime())) cur = new Date();
+       const btn = (label, days, months) => `<button type="button" onclick="geserMasaFree(${days}, ${months})" class="px-2 py-1 rounded border text-xs font-bold ${days < 0 || months < 0 ? 'bg-rose-50 text-rose-700 border-rose-200' : 'bg-teal-50 text-teal-700 border-teal-200'}">${label}</button>`;
+       Swal.fire({
+         title: 'Ubah Masa Berlaku Kredit Free',
+         html: `<div class="text-left">
+           <p class="mb-1 text-sm text-slate-600">Praktisi: <strong>${nama}</strong></p>
+           <p class="mb-4 text-sm text-slate-600">Kredit Free: <strong>${jumlahFree}</strong></p>
+           <label class="text-xs font-bold text-slate-700 uppercase">Berlaku Sampai</label>
+           <input type="datetime-local" id="masaFreeInput" value="${toLocalInput(cur)}" class="w-full mt-1 bg-slate-50 px-4 py-3 rounded border outline-none mb-2">
+           <div class="flex flex-wrap gap-1 mb-3">${btn('-1 Minggu', -7, 0)}${btn('+1 Minggu', 7, 0)}${btn('+2 Minggu', 14, 0)}${btn('+1 Bulan', 0, 1)}${btn('+3 Bulan', 0, 3)}</div>
+           <label class="text-xs font-bold text-slate-700 uppercase">Keterangan</label>
+           <input type="text" id="masaFreeKet" class="w-full mt-1 bg-slate-50 px-4 py-3 rounded border outline-none" placeholder="Misal: Perpanjangan jadi 2 minggu">
+         </div>`,
+         showCancelButton: true, confirmButtonText: 'Simpan',
+         preConfirm: () => {
+           const v = document.getElementById('masaFreeInput').value;
+           if (!v) { Swal.showValidationMessage('Tanggal wajib diisi'); return false; }
+           const d = new Date(v);
+           if (d <= new Date()) { Swal.showValidationMessage('Tanggal harus di masa depan'); return false; }
+           return { expired: d.toISOString(), ket: document.getElementById('masaFreeKet').value };
+         }
+       }).then((result) => {
+         if (result.isConfirmed) {
+           Swal.fire({title: 'Menyimpan Data...', allowOutsideClick: false, didOpen: ()=>Swal.showLoading()});
+           callAPI('editMasaFree', { email: email, expired: result.value.expired, keterangan: result.value.ket }).then(res => {
+             if (res.success) { Swal.fire('Sukses', res.message, 'success'); loadAdminData(); } else { Swal.fire('Gagal', res.message, 'error'); }
+           });
+         }
+       });
+     }
+
+     function geserMasaFree(days, months) {
+       const el = document.getElementById('masaFreeInput');
+       if (!el || !el.value) return;
+       const d = new Date(el.value);
+       if (days) d.setDate(d.getDate() + days);
+       if (months) d.setMonth(d.getMonth() + months);
+       const z = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+       el.value = z.toISOString().slice(0, 16);
+     }
+
      function modalKredit(email, nama, jenis) {
        let modalTitle = "";
        let modalHtml = "";
@@ -14869,7 +14942,7 @@ const CAREER_ENGINE_ANAK = {
            <label class="text-xs font-bold text-slate-700 uppercase">Jumlah Kredit Free</label>
            <input type="number" id="kreditJumlah" class="w-full mt-1 bg-slate-50 px-4 py-3 rounded border outline-none mb-3" min="1">
            <label class="text-xs font-bold text-slate-700 uppercase mb-1 block">Durasi Masa Berlaku</label>
-           <select id="kreditDurasi" class="w-full bg-slate-50 px-4 py-3 rounded border outline-none mb-3 text-sm">
+           <select id="kreditDurasi" class="w-full bg-slate-50 px-4 py-3 rounded border outline-none mb-3 text-sm"><option value="1w">1 Minggu</option><option value="2w">2 Minggu</option>
              <option value="1">1 Bulan</option>
              <option value="2">2 Bulan</option>
              <option value="3">3 Bulan</option>
@@ -18914,7 +18987,9 @@ const CAREER_ENGINE_ANAK = {
               <div>
                 <label class="block text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1">Masa Berlaku Kredit Free</label>
                 <select id="add-durasi-free" class="swal2-input w-full m-0 text-sm px-3 py-2 border border-slate-300 rounded">
-                  <option value="1">1 Bulan</option>
+                  <option value="1w">1 Minggu</option>
+                  <option value="2w">2 Minggu</option>
+              <option value="1">1 Bulan</option>
                   <option value="2">2 Bulan</option>
                   <option value="3">3 Bulan</option>
                   <option value="6">6 Bulan</option>
